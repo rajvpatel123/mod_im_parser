@@ -4,14 +4,16 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import sys
+import traceback
 import numpy as np
 import pandas as pd
-from typing import List, Tuple, Dict, Optional, Protocol
+from typing import List, Dict, Optional
 
 from PySide6 import QtWidgets, QtCore
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QFileDialog, QLabel, QCheckBox, QGroupBox, QScrollArea, QRadioButton, QButtonGroup
+    QFileDialog, QLabel, QCheckBox, QGroupBox, QScrollArea, QRadioButton, QButtonGroup,
+    QTabWidget, QComboBox, QTableWidget, QTableWidgetItem
 )
 
 import matplotlib
@@ -19,6 +21,13 @@ matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+LOGFILE = Path(__file__).with_suffix(".log")
+
+def log_ex(ex: BaseException):
+    try:
+        LOGFILE.write_text("".join(traceback.format_exception(ex)), encoding="utf-8")
+    except Exception:
+        pass
 
 # --------------------------------- Data Model ---------------------------------
 
@@ -32,14 +41,6 @@ class CurveRecord:
         self.rows = rows
         self.freq_hz = freq_hz
         self.freq_label = freq_label
-
-
-# ------------------------------ Parser Protocol --------------------------------
-
-class IMParser(Protocol):
-    def name(self) -> str: ...
-    def can_parse(self, path: Path) -> float: ...
-    def parse(self, path: Path) -> List[CurveRecord]: ...
 
 
 # --------------------------- Helper Functions ----------------------------------
@@ -122,22 +123,17 @@ class ExistingXMLParser:
             name = data.get("name") or cid
             unit = data.get("unit") or ""
             text = (data.text or "").strip() if data.text else ""
-            if text.startswith("[") and text.endswith("]"):
-                text = text[1:-1]
+            if text.startswith("[") and text.endswith("]"): text = text[1:-1]
             items = [s.strip() for s in text.split(",")] if text else []
             vals = []
             for s in items:
                 m = PAIR_RE.match(s)
                 if m:
                     try:
-                        vals.append((float(m.group(1)), float(m.group(2))))
-                        continue
-                    except Exception:
-                        pass
-                try:
-                    vals.append(float(s))
-                except Exception:
-                    vals.append(np.nan)
+                        vals.append((float(m.group(1)), float(m.group(2)))); continue
+                    except Exception: pass
+                try: vals.append(float(s))
+                except Exception: vals.append(np.nan)
             cols[cid] = vals
             meta[cid] = {"name": name, "unit": unit}
             n = max(n, len(vals))
@@ -167,7 +163,7 @@ class ExistingXMLParser:
         return None, "Freq ?"
 
 
-# -------------------------- New Variant Parser (stub) --------------------------
+# -------------------------- New Variant Parser ---------------------------------
 
 class NewVariantParser:
     def name(self) -> str:
@@ -175,94 +171,72 @@ class NewVariantParser:
 
     def can_parse(self, path: Path) -> float:
         try:
-            head = path.read_text(encoding="utf-8", errors="ignore").splitlines()[:5]
+            import xml.etree.ElementTree as ET
+            root = ET.parse(str(path)).getroot()
+            if root.tag.lower() == "datasource" and root.findall(".//curve[@id='IqPowMod']"):
+                return 0.95
         except Exception:
-            return 0.0
-        text = "\n".join(head).lower()
-        if ("b2_re" in text or "b2,real" in text) and ("pdc" in text or "vdd" in text):
-            return 0.6
-        if "<imvariant" in text or "<sweep" in text:
-            return 0.5
+            pass
+        try:
+            head = path.read_text(encoding="utf-8", errors="ignore").splitlines()[:5]
+            text = "\n".join(head).lower()
+            if ("b2_re" in text or "b2,real" in text) and ("pdc" in text or "vdd" in text):
+                return 0.6
+            if "<imvariant" in text or "<sweep" in text:
+                return 0.5
+        except Exception:
+            pass
         return 0.0
 
     def parse(self, path: Path) -> List[CurveRecord]:
-        # Try CSV-like
-        try:
-            df = pd.read_csv(path)
-            cols_lower = {c.lower(): c for c in df.columns}
-            def cand(*keys): return next((cols_lower[k] for k in keys if k in cols_lower), None)
-            b2r = cand("b2_re","b2 real","b2r","b2.real")
-            b2i = cand("b2_im","b2 imag","b2i","b2.imag")
-            a2r = cand("a2_re","a2 real","a2r","a2.real")
-            a2i = cand("a2_im","a2 imag","a2i","a2.imag")
-            pdc = cand("pdc","pdc_w","pdc (w)","pdc[w]","pdc(w)")
-            freq = cand("freq_hz","frequency_hz","freqmhz","freq_mhz","f0_hz")
-
-            if b2r and b2i:
-                if freq:
-                    records: List[CurveRecord] = []
-                    for fval, sub in df.groupby(df[freq]):
-                        cols = {}; meta = {}
-                        cols["B2"] = list(zip(sub[b2r], sub[b2i])); meta["B2"] = {"name":"B2","unit":"sqrtW"}
-                        if a2r and a2i:
-                            cols["A2"] = list(zip(sub[a2r], sub[a2i])); meta["A2"] = {"name":"A2","unit":"sqrtW"}
-                        if pdc:
-                            cols["Pdc"] = sub[pdc].values.tolist(); meta["Pdc"] = {"name":"Pdc","unit":"W"}
-                        n = len(sub)
-                        f_hz = float(fval) if pd.notnull(fval) else None
-                        records.append(CurveRecord("CSV Variant", f"Freq {human_hz(f_hz)}", cols, meta, n, f_hz, human_hz(f_hz)))
-                    return records
-                else:
-                    cols = {}; meta = {}
-                    cols["B2"] = list(zip(df[b2r], df[b2i])); meta["B2"] = {"name":"B2","unit":"sqrtW"}
-                    if a2r and a2i:
-                        cols["A2"] = list(zip(df[a2r], df[a2i])); meta["A2"] = {"name":"A2","unit":"sqrtW"}
-                    if pdc:
-                        cols["Pdc"] = df[pdc].values.tolist(); meta["Pdc"] = {"name":"Pdc","unit":"W"}
-                    n = len(df)
-                    return [CurveRecord("CSV Variant", "Curve 0", cols, meta, n, None, "Freq ?")]
-        except Exception:
-            pass
-
-        # Try alternate XML
-        try:
-            import xml.etree.ElementTree as ET
-            root = ET.parse(str(path)).getroot()
-            if root.tag.lower().startswith("imvariant"):
-                records: List[CurveRecord] = []
-                for sweep in root.findall(".//Sweep"):
-                    f_attr = sweep.get("freq")
-                    f_hz = float(f_attr) if f_attr else None
-                    cols = {"B2": [], "A2": [], "Pdc": []}
-                    meta = {"B2":{"name":"B2","unit":"sqrtW"},
-                            "A2":{"name":"A2","unit":"sqrtW"},
-                            "Pdc":{"name":"Pdc","unit":"W"}}
-                    for pt in sweep.findall("./Point"):
-                        def gf(k):
-                            v = pt.get(k)
-                            try: return float(v) if v is not None else np.nan
-                            except: return np.nan
-                        b2r,b2i = gf("b2r"), gf("b2i")
-                        a2r,a2i = gf("a2r"), gf("a2i")
-                        pdc = gf("pdc")
-                        cols["B2"].append((b2r, b2i))
-                        cols["A2"].append((a2r, a2i))
-                        cols["Pdc"].append(pdc)
-                    n = len(cols["B2"])
-                    records.append(CurveRecord("AltXML Variant", f"Sweep {human_hz(f_hz)}", cols, meta, n, f_hz, human_hz(f_hz)))
-                if records: return records
-        except Exception:
-            pass
-
+        import xml.etree.ElementTree as ET
+        root = ET.parse(str(path)).getroot()
+        if root.tag.lower() == "datasource":
+            records: List[CurveRecord] = []
+            for c in root.findall(".//curve[@id='IqPowMod']"):
+                dname = c.get("id") or "IqPowMod"
+                cname = c.get("name") or (c.get("level") or "")
+                cols: Dict[str, list] = {}
+                meta: Dict[str, dict] = {}
+                nmax = 0
+                for d in c.findall(".//data"):
+                    did = d.get("id") or d.get("data") or f"col_{len(cols)}"
+                    txt = (d.text or "").strip()
+                    if txt.startswith("[") and txt.endswith("]"): txt = txt[1:-1]
+                    vals = []
+                    for token in txt.split(",") if txt else []:
+                        token = token.strip()
+                        try: vals.append(float(token))
+                        except Exception: vals.append(np.nan)
+                    cols[did] = vals
+                    meta[did] = {"name": d.get("name") or did, "unit": d.get("unit") or ""}
+                    nmax = max(nmax, len(vals))
+                for k,v in list(cols.items()):
+                    if len(v) < nmax: cols[k] = v + [np.nan]*(nmax-len(v))
+                # Frequency
+                f_hz = None; f_label = "Freq ?"
+                m = re.search(r"(\d+(?:\.\d+)?)\s*(GHz|MHz|kHz|Hz)", f"{dname} {cname}", flags=re.IGNORECASE)
+                if m:
+                    val = float(m.group(1)); unit = m.group(2).lower()
+                    mult = {"ghz":1e9, "mhz":1e6, "khz":1e3, "hz":1.0}[unit]
+                    f_hz = val*mult; f_label = f"{val:g} {unit.upper()}"
+                records.append(CurveRecord(dname, cname, cols, meta, nmax, f_hz, f_label))
+            if records:
+                return records
         raise RuntimeError("NewVariantParser: could not parse this file; adjust mappings for the new format.")
 
 
 # --------------------------- Parser Registry -----------------------------------
 
-PARSERS: List[IMParser] = [ExistingXMLParser(), NewVariantParser()]
+PARSERS = [ExistingXMLParser(), NewVariantParser()]
 
-def pick_parser(path: Path) -> IMParser:
-    scores = [(p, p.can_parse(path)) for p in PARSERS]
+def pick_parser(path: Path):
+    scores = []
+    for p in PARSERS:
+        try:
+            scores.append((p, p.can_parse(path)))
+        except Exception as e:
+            scores.append((p, 0.0))
     best = max(scores, key=lambda t: t[1])
     if best[1] <= 0.0:
         raise RuntimeError("No parser recognized this .im file")
@@ -270,7 +244,6 @@ def pick_parser(path: Path) -> IMParser:
 
 
 # -------------------------------- Metrics --------------------------------------
-
 
 def compute_metrics(record: CurveRecord, use_gamma_source: bool = False, ignore_a2: bool = False) -> pd.DataFrame:
     # Try wave-based path first
@@ -286,9 +259,8 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool = False, ignore_
     pdc = arr_float(record.cols, record.rows, Pdc_cid)
     gamma_s = arr_complex(record.cols, record.rows, Gs) if use_gamma_source else np.full(record.rows, complex(0.0,0.0))
 
-    # Detect potential ACPR fields (new variant may have these)
+    # Detect potential ACPR fields for new variant
     def find_col_by_name(substrs):
-        # case-insensitive name/id contains all substrs
         for cid, m in record.meta.items():
             nm = (m.get("name") or cid).lower()
             if all(s in nm for s in substrs):
@@ -327,9 +299,7 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool = False, ignore_
         PinAvail_cid = next((cid for cid, m in record.meta.items() if (m.get("name","PinAvail").lower().startswith("pin avail")) or cid.lower()=="pinavail"), None)
         pout_w = arr_float(record.cols, record.rows, Pout_cid)
         pin_av_w = arr_float(record.cols, record.rows, PinAvail_cid)
-        # Gain (available) in dB
         gt_db = 10*np.log10(np.maximum(pout_w / np.where(pin_av_w > 1e-18, pin_av_w, np.nan), 1e-18))
-        # No phase/reflection data in this format
         ampm_deg = np.full(record.rows, np.nan)
         irl_db = np.full(record.rows, np.nan)
 
@@ -347,9 +317,42 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool = False, ignore_
     })
     return df
 
+def record_to_dataframe_with_metrics(record: CurveRecord, use_gamma_source: bool = False, ignore_a2: bool = False) -> pd.DataFrame:
+    n = record.rows
+    cols_out = {}
+    for cid, vals in record.cols.items():
+        name = (record.meta.get(cid, {}).get("name") or cid)
+        if len(vals) and isinstance(vals[0], (tuple, list, complex)):
+            re_arr = np.full(n, np.nan, dtype=float)
+            im_arr = np.full(n, np.nan, dtype=float)
+            for i, v in enumerate(vals):
+                if isinstance(v, complex):
+                    re_arr[i] = np.real(v); im_arr[i] = np.imag(v)
+                elif isinstance(v, (tuple, list)) and len(v) == 2:
+                    try:
+                        re_arr[i] = float(v[0]); im_arr[i] = float(v[1])
+                    except Exception:
+                        pass
+                elif isinstance(v, (int,float)) and np.isfinite(v):
+                    re_arr[i] = float(v); im_arr[i] = 0.0
+            cols_out[f"{name}_re"] = re_arr
+            cols_out[f"{name}_im"] = im_arr
+        else:
+            arr = np.full(n, np.nan, dtype=float)
+            for i, v in enumerate(vals):
+                if isinstance(v, (int,float)) and np.isfinite(v):
+                    arr[i] = float(v)
+            cols_out[name] = arr
+
+    m = compute_metrics(record, use_gamma_source=use_gamma_source, ignore_a2=ignore_a2)
+    for col in m.columns:
+        cols_out[col] = m[col].values
+
+    df = pd.DataFrame(cols_out)
+    return df
+
 
 # ----------------------------------- UI ----------------------------------------
-
 
 class PlotGrid(QWidget):
     def __init__(self, parent=None):
@@ -374,23 +377,21 @@ class PlotGrid(QWidget):
         self.canvas.draw_idle()
 
     def overlay_frequency_curves(self, freq_to_records: Dict[str, List[CurveRecord]], selected_freq_labels: List[str], curve_pref: str, ignore_a2: bool):
-        # We will detect on the fly whether ACPR is available (new variant). If any selected freq has ACPR values, we plot ACPR instead of AM/PM.
         self.clear_axes()
         acpr_present_any = False
 
-        # First pass: detect presence
+        # Detect presence
         for flabel in selected_freq_labels:
             records = freq_to_records.get(flabel, [])
             rec = self._choose_record(records, curve_pref)
             if rec is None: 
                 continue
             df = compute_metrics(rec, use_gamma_source=False, ignore_a2=ignore_a2)
-            has_acpr = np.isfinite(df.get("ACPR Lower [dBc] @ f0", pd.Series([]))).any() or np.isfinite(df.get("ACPR Upper [dBc] @ f0", pd.Series([]))).any()
-            if has_acpr:
-                acpr_present_any = True
-                break
+            sL = df.get("ACPR Lower [dBc] @ f0")
+            sU = df.get("ACPR Upper [dBc] @ f0")
+            if sL is not None and np.isfinite(sL.values).any(): acpr_present_any = True; break
+            if sU is not None and np.isfinite(sU.values).any(): acpr_present_any = True; break
 
-        # Second pass: plot
         for flabel in selected_freq_labels:
             records = freq_to_records.get(flabel, [])
             rec = self._choose_record(records, curve_pref)
@@ -402,39 +403,33 @@ class PlotGrid(QWidget):
             # Gain
             y = df['Gt [dB] @ f0'].values
             m = np.isfinite(x) & np.isfinite(y)
-            if m.any():
-                self.ax_gain.plot(x[m], y[m], label=flabel)
+            if m.any(): self.ax_gain.plot(x[m], y[m], label=flabel)
 
             # AM/PM or ACPR
             if acpr_present_any:
-                # Plot both lower and upper if present
-                yL = df.get('ACPR Lower [dBc] @ f0', pd.Series(np.full_like(x, np.nan, dtype=float))).values
-                yU = df.get('ACPR Upper [dBc] @ f0', pd.Series(np.full_like(x, np.nan, dtype=float))).values
-                mL = np.isfinite(x) & np.isfinite(yL)
-                mU = np.isfinite(x) & np.isfinite(yU)
-                if mL.any():
-                    self.ax_ampm_or_acpr.plot(x[mL], yL[mL], label=f'{flabel} (L)')
-                if mU.any():
-                    self.ax_ampm_or_acpr.plot(x[mU], yU[mU], label=f'{flabel} (U)')
+                yL = df.get('ACPR Lower [dBc] @ f0')
+                yU = df.get('ACPR Upper [dBc] @ f0')
+                if yL is not None:
+                    mL = np.isfinite(x) & np.isfinite(yL.values)
+                    if mL.any(): self.ax_ampm_or_acpr.plot(x[mL], yL.values[mL], label=f'{flabel} (L)')
+                if yU is not None:
+                    mU = np.isfinite(x) & np.isfinite(yU.values)
+                    if mU.any(): self.ax_ampm_or_acpr.plot(x[mU], yU.values[mU], label=f'{flabel} (U)')
             else:
                 y = df['AM/PM offset [deg] @ f0'].values
                 m = np.isfinite(x) & np.isfinite(y)
-                if m.any():
-                    self.ax_ampm_or_acpr.plot(x[m], y[m], label=flabel)
+                if m.any(): self.ax_ampm_or_acpr.plot(x[m], y[m], label=flabel)
 
             # Drain Eff
             y = df['Drain Efficiency [%] @ f0'].values
             m = np.isfinite(x) & np.isfinite(y)
-            if m.any():
-                self.ax_eff.plot(x[m], y[m], label=flabel)
+            if m.any(): self.ax_eff.plot(x[m], y[m], label=flabel)
 
             # Input RL
             y = df['Input Return Loss [dB] @ f0'].values
             m = np.isfinite(x) & np.isfinite(y)
-            if m.any():
-                self.ax_irl.plot(x[m], y[m], label=flabel)
+            if m.any(): self.ax_irl.plot(x[m], y[m], label=flabel)
 
-        # Titles & labels
         self.ax_gain.set_title('Gain @ f0 vs Pout')
         self.ax_gain.set_xlabel('Pout [dBm] @ f0'); self.ax_gain.set_ylabel('Gt [dB] @ f0'); self.ax_gain.legend()
 
@@ -452,18 +447,6 @@ class PlotGrid(QWidget):
         self.ax_irl.set_xlabel('Pout [dBm] @ f0'); self.ax_irl.set_ylabel('Input Return Loss [dB] @ f0'); self.ax_irl.legend()
 
         self.draw()
-
-    @staticmethod
-    def _choose_record(records: List[CurveRecord], curve_pref: str) -> Optional[CurveRecord]:
-        if not records: return None
-        s = curve_pref.lower()
-        for r in records:
-            name = f"{r.dataset_name} {r.curve_name}".lower()
-            if "1-tone" in name and s in name: return r
-        for r in records:
-            name = f"{r.dataset_name} {r.curve_name}".lower()
-            if "1-tone" in name: return r
-        return records[0]
 
     @staticmethod
     def _choose_record(records: List[CurveRecord], curve_pref: str) -> Optional[CurveRecord]:
@@ -545,32 +528,163 @@ class ControlsPanel(QGroupBox):
     def ignore_a2(self) -> bool: return self.cb_ignore_a2.isChecked()
 
 
+class TablesTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.freq_to_records: Dict[str, List[CurveRecord]] = {}
+        self.ignore_a2 = False
+        self.curve_pref = "s1"
+
+        v = QVBoxLayout(self)
+
+        controls = QHBoxLayout()
+        self.cmb_freq = QComboBox()
+        self.cmb_curve = QComboBox()
+        self.btn_export = QPushButton("Export CSV…")
+        controls.addWidget(QLabel("Frequency:"))
+        controls.addWidget(self.cmb_freq)
+        controls.addSpacing(12)
+        controls.addWidget(QLabel("Curve:"))
+        controls.addWidget(self.cmb_curve)
+        controls.addStretch(1)
+        controls.addWidget(self.btn_export)
+        v.addLayout(controls)
+
+        self.table = QTableWidget()
+        v.addWidget(self.table, 1)
+
+        self.cmb_freq.currentIndexChanged.connect(self._on_freq_changed)
+        self.cmb_curve.currentIndexChanged.connect(self._on_curve_changed)
+        self.btn_export.clicked.connect(self._on_export)
+
+    def set_data(self, freq_to_records: Dict[str, List[CurveRecord]], labels_sorted: List[str], curve_pref: str, ignore_a2: bool):
+        self.freq_to_records = freq_to_records
+        self.curve_pref = curve_pref
+        self.ignore_a2 = ignore_a2
+
+        self.cmb_freq.blockSignals(True)
+        self.cmb_freq.clear()
+        for lab in labels_sorted:
+            self.cmb_freq.addItem(lab)
+        self.cmb_freq.blockSignals(False)
+
+        if labels_sorted:
+            self.cmb_freq.setCurrentIndex(0)
+            self._populate_curves_for_selected_freq()
+            self._populate_table()
+
+    def _choose_record(self, records: List[CurveRecord]) -> Optional[CurveRecord]:
+        if not records: return None
+        s = self.curve_pref.lower()
+        for r in records:
+            name = f"{r.dataset_name} {r.curve_name}".lower()
+            if "1-tone" in name and s in name: return r
+        for r in records:
+            name = f"{r.dataset_name} {r.curve_name}".lower()
+            if "1-tone" in name: return r
+        return records[0]
+
+    def _on_freq_changed(self, _idx):
+        self._populate_curves_for_selected_freq()
+        self._populate_table()
+
+    def _on_curve_changed(self, _idx):
+        self._populate_table()
+
+    def _populate_curves_for_selected_freq(self):
+        lab = self.cmb_freq.currentText()
+        recs = self.freq_to_records.get(lab, [])
+        self.cmb_curve.blockSignals(True)
+        self.cmb_curve.clear()
+        for r in recs:
+            self.cmb_curve.addItem(r.curve_name)
+        self.cmb_curve.blockSignals(False)
+        if recs:
+            self.cmb_curve.setCurrentIndex(0)
+
+    def _current_record(self) -> Optional[CurveRecord]:
+        lab = self.cmb_freq.currentText()
+        recs = self.freq_to_records.get(lab, [])
+        if not recs: return None
+        wanted = self.cmb_curve.currentText()
+        for r in recs:
+            if r.curve_name == wanted:
+                return r
+        return self._choose_record(recs)
+
+    def _populate_table(self):
+        rec = self._current_record()
+        if rec is None:
+            self.table.clear()
+            self.table.setRowCount(0); self.table.setColumnCount(0)
+            return
+        try:
+            df = record_to_dataframe_with_metrics(rec, ignore_a2=self.ignore_a2)
+        except Exception as e:
+            log_ex(e)
+            QtWidgets.QMessageBox.critical(self, "Compute error", f"{e}\n\nSee log: {LOGFILE}")
+            return
+
+        self.table.clear()
+        self.table.setRowCount(len(df.index))
+        self.table.setColumnCount(len(df.columns))
+        self.table.setHorizontalHeaderLabels([str(c) for c in df.columns])
+
+        for j, col in enumerate(df.columns):
+            col_vals = df[col].values
+            for i, val in enumerate(col_vals):
+                txt = ""
+                if isinstance(val, (int,float)) and np.isfinite(val):
+                    txt = f"{val:.6g}"
+                item = QTableWidgetItem(txt)
+                self.table.setItem(i, j, item)
+
+        self.table.resizeColumnsToContents()
+
+    def _on_export(self):
+        rec = self._current_record()
+        if rec is None: return
+        try:
+            df = record_to_dataframe_with_metrics(rec, ignore_a2=self.ignore_a2)
+            suggested = f"table_{(rec.freq_label or 'Freq')}_{re.sub(r'[^A-Za-z0-9_\\-]+','_',rec.curve_name)}.csv"
+            path, _ = QFileDialog.getSaveFileName(self, "Export CSV", suggested, "CSV files (*.csv)")
+            if not path: return
+            df.to_csv(path, index=False)
+        except Exception as e:
+            log_ex(e)
+            QtWidgets.QMessageBox.critical(self, "Export failed", f"{e}\n\nSee log: {LOGFILE}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("IM Desktop — Multi‑Format")
+        self.setWindowTitle("IM Desktop — Multi‑Format (Safe)")
 
         self.curves: List[CurveRecord] = []
         self.freq_to_records: Dict[str, List[CurveRecord]] = {}
+        self.labels_sorted: List[str] = []
 
         central = QWidget(); self.setCentralWidget(central)
-        h = QHBoxLayout(central)
+        outer = QHBoxLayout(central)
 
         left = QVBoxLayout()
         btn_open = QPushButton("Open .im…"); btn_open.clicked.connect(self.open_file)
         self.controls = ControlsPanel()
         self.freq_panel = FrequencyPanel()
-
         left.addWidget(btn_open); left.addWidget(self.controls); left.addWidget(self.freq_panel); left.addStretch(1)
 
+        self.tabs = QTabWidget()
         self.plot_grid = PlotGrid()
+        plot_tab = QWidget(); plot_tab_layout = QVBoxLayout(plot_tab); plot_tab_layout.addWidget(self.plot_grid)
+        self.tabs.addTab(plot_tab, "Plots")
+        self.tables_tab = TablesTab(); self.tabs.addTab(self.tables_tab, "Tables")
 
-        h.addLayout(left, 0); h.addWidget(self.plot_grid, 1)
+        outer.addLayout(left, 0); outer.addWidget(self.tabs, 1)
 
-        self.controls.on_changed.connect(self.update_plots)
-        self.freq_panel.on_changed.connect(self.update_plots)
+        self.controls.on_changed.connect(self.on_controls_changed)
+        self.freq_panel.on_changed.connect(self.on_freq_selection_changed)
 
-        self.statusBar().showMessage("Open a .im file to begin")
+        self.statusBar().showMessage('Open a .im file to begin')
 
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open .im file", "", "IM files (*.im);;All files (*)")
@@ -578,19 +692,18 @@ class MainWindow(QMainWindow):
         try:
             self.load_file(Path(path))
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Failed to load", f"{e}")
+            log_ex(e)
+            QtWidgets.QMessageBox.critical(self, "Failed to load", f"{e}\n\nSee log: {LOGFILE}")
 
     def load_file(self, path: Path):
         parser = pick_parser(path)
         records = parser.parse(path)
 
-        # Build frequency map
         freq_map: Dict[str, List[CurveRecord]] = {}
         for rec in records:
             lab = rec.freq_label or "Freq ?"
             freq_map.setdefault(lab, []).append(rec)
 
-        # Sort by numeric Hz if possible
         def label_to_hz(lbl: str) -> float:
             m = FREQ_NAME_RE.search(lbl)
             if not m: return float("inf")
@@ -601,24 +714,74 @@ class MainWindow(QMainWindow):
 
         self.curves = records
         self.freq_to_records = freq_map
+        self.labels_sorted = labels_sorted
         self.freq_panel.set_frequencies(labels_sorted)
 
         self.statusBar().showMessage(f"Loaded {len(records)} curves via {parser.name()} — Frequencies: {', '.join(labels_sorted)}")
         self.update_plots()
+        self.update_tables_tab()
+
+    def on_controls_changed(self):
+        self.update_plots(); self.update_tables_tab()
+
+    def on_freq_selection_changed(self):
+        self.update_plots(); self.update_tables_tab()
+
+    def update_tables_tab(self):
+        if not self.curves: return
+        try:
+            self.tables_tab.set_data(self.freq_to_records, self.labels_sorted, self.controls.curve_pref(), self.controls.ignore_a2())
+        except Exception as e:
+            log_ex(e)
 
     def update_plots(self):
         if not self.curves: return
         selected = self.freq_panel.selected_labels()
         if not selected:
             self.plot_grid.clear_axes(); self.plot_grid.draw()
-            self.statusBar().showMessage("No frequencies selected"); return
+            self.statusBar().showMessage('No frequencies selected')
+            return
         curve_pref = self.controls.curve_pref()
         ignore_a2 = self.controls.ignore_a2()
-        self.plot_grid.overlay_frequency_curves(self.freq_to_records, selected, curve_pref, ignore_a2)
-        self.statusBar().showMessage(f"Plotted {len(selected)} frequencies • Pref: {curve_pref.upper()} • {'Pout=|B2|^2' if ignore_a2 else 'Pout=|B2|^2−|A2|^2'}")
+        try:
+            self.plot_grid.overlay_frequency_curves(self.freq_to_records, selected, curve_pref, ignore_a2)
+            self.statusBar().showMessage(f'Plotted {len(selected)} frequencies • Pref: {curve_pref.upper()} • {"Pout=|B2|^2" if ignore_a2 else "Pout=|B2|^2−|A2|^2"}')
+        except Exception as e:
+            log_ex(e)
+            QtWidgets.QMessageBox.critical(self, "Plot error", f"{e}\n\nSee log: {LOGFILE}")
+
+
+class ControlsPanel(QGroupBox):
+    on_changed = QtCore.Signal()
+    def __init__(self, parent=None):
+        super().__init__("Controls", parent)
+        v = QVBoxLayout(self)
+
+        v.addWidget(QLabel("1‑Tone family"))
+        self.grp = QButtonGroup(self)
+        self.rb_s1 = QRadioButton("S1"); self.rb_s3 = QRadioButton("S3")
+        self.rb_s1.setChecked(True)
+        self.grp.addButton(self.rb_s1); self.grp.addButton(self.rb_s3)
+        v.addWidget(self.rb_s1); v.addWidget(self.rb_s3)
+        self.rb_s1.toggled.connect(lambda _ch: self.on_changed.emit())
+        self.rb_s3.toggled.connect(lambda _ch: self.on_changed.emit())
+
+        self.cb_ignore_a2 = QCheckBox("Disregard A2 (assume Pout = |B2|²)")
+        self.cb_ignore_a2.setChecked(False)
+        self.cb_ignore_a2.stateChanged.connect(lambda _st: self.on_changed.emit())
+        v.addWidget(self.cb_ignore_a2)
+
+        v.addStretch(1)
+
+    def curve_pref(self) -> str: return "s1" if self.rb_s1.isChecked() else "s3"
+    def ignore_a2(self) -> bool: return self.cb_ignore_a2.isChecked()
 
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    w = MainWindow(); w.resize(1200, 800); w.show()
-    sys.exit(app.exec())
+    try:
+        app = QApplication(sys.argv)
+        w = MainWindow(); w.resize(1200, 800); w.show()
+        sys.exit(app.exec())
+    except Exception as e:
+        log_ex(e)
+        raise
