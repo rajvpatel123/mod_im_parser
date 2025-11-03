@@ -317,6 +317,26 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool = False, ignore_
     })
     return df
 
+
+def _extract_spectrum_pairs(record: CurveRecord):
+    # Return list of (freq_Hz array, power_dBm array) pairs if present, else []
+    if "SpectrumFreq" not in record.cols or "SpectrumRawPower" not in record.cols:
+        return []
+    freqs = record.cols["SpectrumFreq"]
+    powers = record.cols["SpectrumRawPower"]
+    # They may be stored as multiple arrays serialized in order; we treat them in pairs
+    pairs = []
+    # If they are flat numeric lists, just one pair
+    try:
+        if isinstance(freqs, list) and freqs and isinstance(freqs[0], (int,float)) and isinstance(powers, list) and powers and isinstance(powers[0], (int,float)):
+            pairs.append((np.array(freqs, dtype=float), np.array(powers, dtype=float)))
+            return pairs
+    except Exception:
+        pass
+    # Otherwise, attempt best-effort pairing (already flattened by parser, so above path will trigger)
+    return pairs
+
+
 def record_to_dataframe_with_metrics(record: CurveRecord, use_gamma_source: bool = False, ignore_a2: bool = False) -> pd.DataFrame:
     n = record.rows
     cols_out = {}
@@ -425,10 +445,16 @@ class PlotGrid(QWidget):
             m = np.isfinite(x) & np.isfinite(y)
             if m.any(): self.ax_eff.plot(x[m], y[m], label=flabel)
 
-            # Input RL
-            y = df['Input Return Loss [dB] @ f0'].values
-            m = np.isfinite(x) & np.isfinite(y)
-            if m.any(): self.ax_irl.plot(x[m], y[m], label=flabel)
+            # Input RL or Spectrum (Normalized Frequency)
+            spec_pairs = _extract_spectrum_pairs(rec)
+            if spec_pairs:
+                fHz, pDbm = spec_pairs[-1]
+                if fHz.size and pDbm.size:
+                    self.ax_irl.plot(fHz/1e6, pDbm, label=f'{flabel} spectrum')
+            else:
+                y = df['Input Return Loss [dB] @ f0'].values
+                m = np.isfinite(x) & np.isfinite(y)
+                if m.any(): self.ax_irl.plot(x[m], y[m], label=flabel)
 
         self.ax_gain.set_title('Gain @ f0 vs Pout')
         self.ax_gain.set_xlabel('Pout [dBm] @ f0'); self.ax_gain.set_ylabel('Gt [dB] @ f0'); self.ax_gain.legend()
@@ -444,7 +470,23 @@ class PlotGrid(QWidget):
         self.ax_eff.set_xlabel('Pout [dBm] @ f0'); self.ax_eff.set_ylabel('Drain Efficiency [%] @ f0'); self.ax_eff.legend()
 
         self.ax_irl.set_title('Input Return Loss @ f0 vs Pout')
-        self.ax_irl.set_xlabel('Pout [dBm] @ f0'); self.ax_irl.set_ylabel('Input Return Loss [dB] @ f0'); self.ax_irl.legend()
+        # If any selected record has spectrum, relabel to Normalized Frequency plot (bottom-right)
+        try:
+            has_spectrum = False
+            for flabel in selected_freq_labels:
+                recs = freq_to_records.get(flabel, [])
+                rec = self._choose_record(recs, curve_pref)
+                if rec and _extract_spectrum_pairs(rec):
+                    has_spectrum = True; break
+            if has_spectrum:
+                self.ax_irl.set_title('Normalized Frequency Spectrum')
+                self.ax_irl.set_xlabel('Frequency Offset [MHz]')
+                self.ax_irl.set_ylabel('Power [dBm]')
+            else:
+                self.ax_irl.set_xlabel('Pout [dBm] @ f0'); self.ax_irl.set_ylabel('Input Return Loss [dB] @ f0')
+        except Exception:
+            self.ax_irl.set_xlabel('Pout [dBm] @ f0'); self.ax_irl.set_ylabel('Input Return Loss [dB] @ f0')
+        self.ax_irl.legend()
 
         self.draw()
 
