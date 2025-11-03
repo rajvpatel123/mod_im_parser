@@ -272,13 +272,13 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool = False, ignore_
     drain_eff = np.where(pdc > 0, (pout_w / pdc) * 100.0, np.nan)
 
     df = pd.DataFrame({
-        "Pout [dBm] @ f0": pout_dbm,
-        "Gt [dB] @ f0": gt_db,
-        "AM/PM offset [deg] @ f0": ampm_deg,
-        "Drain Efficiency [%] @ f0": drain_eff,
-        "Input Return Loss [dB] @ f0": irl_db,
-        "ACPR Lower [dBc] @ f0": acpr_lower,
-        "ACPR Upper [dBc] @ f0": acpr_upper,
+        "Pout [dBm]": pout_dbm,
+        "Gt [dB]": gt_db,
+        "AM/PM offset [deg]": ampm_deg,
+        "Drain Efficiency [%]": drain_eff,
+        "Input Return Loss [dB]": irl_db,
+        "ACPR Lower [dBc]": acpr_lower,
+        "ACPR Upper [dBc]": acpr_upper,
     })
     return df
 
