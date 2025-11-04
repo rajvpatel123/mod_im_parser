@@ -1281,7 +1281,28 @@ class SParamPlotGrid(QWidget):
         return self._param_color[key]
 
     def plot(self, series, show_params, mag_mode, unwrap, smith_param, polar_param='S11', polar_mag='linear'):
-        # series: list of dicts {label, freq, params, z0, file_idx}
+
+        import matplotlib
+        # Determine multi-file vs single-file
+        files = [it.get('file_idx', 0) for it in series]
+        multi = len(set(files)) > 1
+        palette = matplotlib.rcParams['axes.prop_cycle'].by_key().get(
+            'color', ['C0','C1','C2','C3','C4','C5','C6','C7','C8','C9']
+        )
+        if multi:
+            old = self.color_for_param
+            self.color_for_param = lambda sij: palette[getattr(self, "_current_file_idx", 0) % len(palette)]
+            try:
+                cleaned = []
+                for it in series:
+                    if 'file_idx' not in it:
+                        it = dict(it); it['file_idx'] = 0
+                    self._current_file_idx = it['file_idx']
+                    cleaned.append(it)
+                series = cleaned
+                # original body continues below...
+            finally:
+                pass        # series: list of dicts {label, freq, params, z0, file_idx}
         for ax in [self.ax_mag, self.ax_phase, self.ax_gd, self.ax_smith, self.ax_polar]:
             ax.cla()
         _smith_axes(self.ax_smith)
@@ -1346,6 +1367,8 @@ class SParamPlotGrid(QWidget):
         self.ax_polar.set_title("Polar Plot (angle vs |S|)"); self._apply_legend(self.ax_polar)
         self.draw()
 
+        if 'multi' in locals() and multi:
+            self.color_for_param = old
 class SParamTab(QWidget):
     def __init__(self, controls_panel: 'ControlsPanel', parent=None):
         super().__init__(parent)
@@ -1533,6 +1556,8 @@ class MainWindow(QMainWindow):
         # NEW: S-parameters tab
         self.sparam_tab = SParamTab(self.controls)
         self.tabs.addTab(self.sparam_tab, "S‑parameters")
+        self.tables_tab = TablesTab(self)
+        self.tabs.addTab(self.tables_tab, "Tables")
 
         outer.addWidget(self.tabs, 1)
         outer.addLayout(left, 0)
@@ -1614,6 +1639,7 @@ class MainWindow(QMainWindow):
         self.series_panel.set_series([])
         self.plot_grid.clear_axes(); self.plot_grid.draw()
         self.tables_tab.set_data({}, [], "s1", False)
+        self.tables_tab.set_data({}, [], 's1', False)
         self.statusBar().showMessage('Cleared all sources')
 
     def _ingest_file(self, path: Path, index: int):
@@ -1635,6 +1661,37 @@ class MainWindow(QMainWindow):
         self.tables_tab.set_data(combined_map, combined_labels, self.controls.curve_pref(), self.controls.ignore_a2())
 
         self.update_plots()
+
+    def _refresh_tables(self):
+        # Build mapping for the Tables tab from current selection (fallback to all)
+        combined_map = {}
+        combined_labels = []
+        selected = []
+        try:
+            selected = self.series_panel.selected_series()
+        except Exception:
+            selected = []
+        if selected:
+            for (si, lab) in selected:
+                if si < 0 or si >= len(self.sources): 
+                    continue
+                src = self.sources[si]
+                recs = src.freq_to_records.get(lab, [])
+                if not recs:
+                    continue
+                label = f"{src.file_label} • {lab}"
+                combined_map[label] = recs
+                combined_labels.append(label)
+        else:
+            for src in self.sources:
+                for lab, recs in src.freq_to_records.items():
+                    label = f"{src.file_label} • {lab}"
+                    combined_map[label] = recs
+                    combined_labels.append(label)
+        try:
+            self.tables_tab.set_data(combined_map, combined_labels, self.controls.curve_pref(), self.controls.ignore_a2())
+        except Exception:
+            pass
 
     # CONTROLS REACTIONS
     def on_controls_changed(self):
@@ -1658,7 +1715,9 @@ class MainWindow(QMainWindow):
         self.plot_grid.legend_ncol = self.controls.legend_ncol()
         self.plot_grid.compact_labels = self.controls.compact_labels()
         self.update_plots()
-        # Keep tables consistent with curve family / ignore A2
+        
+        self._refresh_tables()
+# Keep tables consistent with curve family / ignore A2
         if self.sources:
             combined_map: Dict[str, List[CurveRecord]] = {}
             combined_labels: List[str] = []
@@ -1865,6 +1924,8 @@ class MainWindowSingle(QMainWindow):
         # Only two tabs: IM and S-parameters (Tables tab intentionally removed)
         self.tabs.addTab(self.im_tab, "IM (1‑tone)")
         self.tabs.addTab(self.sparam_tab, "S‑parameters")
+        self.tables_tab = TablesTab(self)
+        self.tabs.addTab(self.tables_tab, "Tables")
 
         # --- Left sidebar ---
         left_sidebar = QWidget()
@@ -1886,6 +1947,21 @@ class MainWindowSingle(QMainWindow):
         splitter.setStretchFactor(0,0); splitter.setStretchFactor(1,1)
         left_sidebar.setMinimumWidth(300)
         self.setCentralWidget(splitter)
+        # Install wheel forwarding so the mouse wheel scrolls the page even over canvases
+        scrolls = self.findChildren(QScrollArea)
+        if scrolls:
+            _wheel = _WheelForwardFilter(scrolls[0])
+            try:
+                self.plot_grid.canvas.installEventFilter(_wheel)
+            except Exception:
+                pass
+            try:
+                if hasattr(self.sparam_tab, 'grid'):
+                    for ax in getattr(self.sparam_tab.grid, 'axes', []):
+                        if hasattr(ax, 'figure') and hasattr(ax.figure, 'canvas'):
+                            ax.figure.canvas.installEventFilter(_wheel)
+            except Exception:
+                pass
 
         # Wire actions
         self.btn_load_im.clicked.connect(self.open_files)
@@ -1897,6 +1973,12 @@ class MainWindowSingle(QMainWindow):
         # Tab sync
         self.controls.set_mode('im')
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        try:
+            self.series_panel.on_changed.connect(self._refresh_tables)
+        except Exception:
+            pass
+        self.controls.on_changed.connect(self._refresh_tables)
+        self.tabs.currentChanged.connect(lambda i: (self._refresh_tables() if self.tabs.tabText(i)=="Tables" else None))
 
         # Default to light (hide dark toggle if present)
         try:
@@ -1958,6 +2040,37 @@ class MainWindowSingle(QMainWindow):
         except Exception:
             pass
         self.update_plots()
+
+    def _refresh_tables(self):
+        # Build mapping for the Tables tab from current selection (fallback to all)
+        combined_map = {}
+        combined_labels = []
+        selected = []
+        try:
+            selected = self.series_panel.selected_series()
+        except Exception:
+            selected = []
+        if selected:
+            for (si, lab) in selected:
+                if si < 0 or si >= len(self.sources): 
+                    continue
+                src = self.sources[si]
+                recs = src.freq_to_records.get(lab, [])
+                if not recs:
+                    continue
+                label = f"{src.file_label} • {lab}"
+                combined_map[label] = recs
+                combined_labels.append(label)
+        else:
+            for src in self.sources:
+                for lab, recs in src.freq_to_records.items():
+                    label = f"{src.file_label} • {lab}"
+                    combined_map[label] = recs
+                    combined_labels.append(label)
+        try:
+            self.tables_tab.set_data(combined_map, combined_labels, self.controls.curve_pref(), self.controls.ignore_a2())
+        except Exception:
+            pass
 
     # ---------- Plotting (same logic as baseline MainWindow) ----------
     def _build_mapping_for_plots(self, selected):
@@ -2043,7 +2156,25 @@ class MainWindowSingle(QMainWindow):
             pass
         self.update_plots()
 
-if __name__ == '__main__':
+# [__main__ removed for single-file rebuild]
+
+
+
+# ---------- Mouse wheel forwarding ----------
+from PySide6 import QtGui as _QtGui
+class _WheelForwardFilter(QtCore.QObject):
+    def __init__(self, target_scroll_area):
+        super().__init__(); self.target = target_scroll_area
+    def eventFilter(self, obj, event):
+        if isinstance(event, _QtGui.QWheelEvent):
+            QtWidgets.QApplication.sendEvent(self.target.viewport(), event); return True
+        return False
+
+
+
+if __name__ == "__main__":
+    from PySide6.QtWidgets import QApplication
+    import sys
     app = QApplication(sys.argv)
     w = MainWindowSingle()
     w.resize(1400, 900)
