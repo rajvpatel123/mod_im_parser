@@ -7,7 +7,7 @@ comparison, a numeric Tables view, and a color policy that is designed for
 comparing different devices/runs.
 
 Main file you have:
-    im_app_single_sidebar_SCROLL_TABLES_COLORFILE_FINAL_fix.py
+   parser_main.py
 
 ---------------------------------------------------------------------
 FEATURES
@@ -37,7 +37,7 @@ FEATURES
 
 - UI niceties
   Left sidebar for file/series selection; plot area is scrollable; mouse‑wheel
-  scroll works over charts; light theme by default; offline‑friendly.
+  scroll works over charts; offline‑friendly.
 
 ---------------------------------------------------------------------
 REQUIREMENTS
@@ -53,21 +53,13 @@ QUICK START
 1) Place the main app file somewhere convenient:
        im_app_single_sidebar_SCROLL_TABLES_COLORFILE_FINAL_fix.py
 
-2) (Optional) Put sample data under:
-       sample_data/
-   Suggested demo files (provided in this repo or create your own):
-       sample_data/sample_im_deviceA_3p5GHz.im
-       sample_data/sample_im_deviceB_3p5GHz.im
-       sample_data/sample_sparams_deviceA.s2p
-       sample_data/sample_sparams_deviceB.s2p
-
-3) Install dependencies:
+2) Install dependencies:
        pip install PySide6 matplotlib numpy pandas
 
-4) Run:
+3) Run:
        python im_app_single_sidebar_SCROLL_TABLES_COLORFILE_FINAL_fix.py
 
-5) In the app:
+4) In the app:
    - IM tab:  “Open .im…”             (load one or more .im files)
    - S‑params: load .s2p files        (Touchstone v1)
    - Choose files and series/frequencies in the left sidebar.
@@ -130,12 +122,4 @@ TROUBLESHOOTING
       has the required packages installed.
 
 
----------------------------------------------------------------------
-CONTACT / ISSUES
----------------------------------------------------------------------
-Open a GitHub issue with:
-  • OS + Python version
-  • The command you ran
-  • A small sample .im/.s2p (if possible)
-  • A screenshot or error log
 
