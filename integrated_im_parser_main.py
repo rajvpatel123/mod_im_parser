@@ -524,14 +524,16 @@ class PlotGrid(QWidget):
                                  show_acpr_any: bool):
         self.clear_axes()
 
+        file_indices = sorted({ mapping.get(lbl, (0, []))[0] for lbl in selected_labels })
+        multi = (len(file_indices) > 1)
         for label in selected_labels:
             file_index, records = mapping.get(label, (0, []))
             rec = self._choose_record(records, curve_pref)
             if rec is None: continue
             df = compute_metrics(rec, use_gamma_source=False, ignore_a2=ignore_a2)
             x = df['Pout [dBm] @ f0'].values
-            # color by frequency (consistent across files), linestyle by file
-            color = self._color_for_freq(rec.freq_label)
+            # color policy: multi-file => color per file; single-file => color per frequency
+            color = (file_color(file_index) if multi else self._color_for_freq(rec.freq_label))
             ls = LINESTYLES[file_index % len(LINESTYLES)]
 
             if self.show_gain:
@@ -1280,7 +1282,7 @@ class SParamPlotGrid(QWidget):
             self._param_color[key] = self._color_cycle[idx]
         return self._param_color[key]
 
-    def plot(self, series, show_params, mag_mode, unwrap, smith_param, polar_param='S11', polar_mag='linear'):
+    def plot(self, series, show_params, mag_mode, unwrap, smith_param, polar_param='S11', polar_mag='linear', multi_file=False):
         # series: list of dicts {label, freq, params, z0, file_idx}
         for ax in [self.ax_mag, self.ax_phase, self.ax_gd, self.ax_smith, self.ax_polar]:
             ax.cla()
@@ -1291,7 +1293,7 @@ class SParamPlotGrid(QWidget):
             for sij in show_params:
                 if sij not in params: continue
                 y = params[sij]
-                color = self.color_for_param(sij)
+                color = (file_color(item.get('file_idx',0)) if multi_file else self.color_for_param(sij))
                 ls = ["-","--",":","-."][item.get('file_idx',0) % 4]
                 # Magnitude
                 mag = 20*np.log10(np.clip(np.abs(y), 1e-18, 1.0)) if mag_mode == "dB" else np.abs(y)
@@ -1479,7 +1481,8 @@ class SParamTab(QWidget):
         smith_param = self.controls_panel.sparam_smith()
         polar_param = self.controls_panel.sparam_polar_param()
         polar_mag = self.controls_panel.sparam_polar_mag()
-        self.grid.plot(series, show_params, mag_mode, unwrap, smith_param, polar_param, polar_mag)
+        multi_file = len(set([s['file_idx'] for s in series])) > 1
+        self.grid.plot(series, show_params, mag_mode, unwrap, smith_param, polar_param, polar_mag, multi_file=multi_file)
 
 class MainWindow(QMainWindow):
     def __init__(self):
