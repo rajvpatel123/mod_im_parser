@@ -242,9 +242,12 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool = False, ignore_
     if have_waves:
         has_a2 = np.isfinite(np.real(a2)).any()
         if ignore_a2 or not has_a2:
-            pout_w = np.abs(b2)**2
+            b2 = b2/np.sqrt(2)
+            pout_w = np.abs(b2*b2)
         else:
-            pout_w = np.maximum(np.abs(b2)**2 - np.abs(a2)**2, 0.0)
+            b2 = b2/np.sqrt(2)
+            a2 = a2/np.sqrt(2)
+            pout_w = np.maximum(np.abs(b2*b2) - np.abs(a2*a2), 0.0)
         pavs_w = np.abs(a1)**2 * (1.0 - np.minimum(np.abs(gamma_s)**2, 0.999999))
         gt_db = 10*np.log10(np.maximum(pout_w / np.where(pavs_w > 1e-18, pavs_w, np.nan), 1e-18))
         phase_rel = np.unwrap(np.angle(b2) - np.angle(a1))
