@@ -1,6 +1,28 @@
 from PySide6.QtCore import Qt
 
 
+
+
+
+
+# ---- Qt flag fallbacks for broader PySide6 compatibility ----
+# Produce values of type Qt.ItemFlag so bitwise OR with item.flags() works.
+try:
+    ITEM_TRISTATE = getattr(Qt, 'ItemIsTristate')
+except Exception:
+    # 0x100 is the usual value; wrap as Qt.ItemFlag
+    ITEM_TRISTATE = Qt.ItemFlag(0x100)
+try:
+    ITEM_USERCHECKABLE = getattr(Qt, 'ItemIsUserCheckable')
+except Exception:
+    # 0x10 is the usual value; wrap as Qt.ItemFlag
+    ITEM_USERCHECKABLE = Qt.ItemFlag(0x10)
+
+except Exception:
+    # If Qt isn't available yet for some reason, hard fallback values
+    ITEM_TRISTATE = 0x100
+    ITEM_USERCHECKABLE = 0x10
+
 import sys, traceback, re, json
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -8,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 from PySide6 import QtWidgets, QtCore, QtGui
-from PySide6.QtWidgets import QSizePolicy
+from PySide6.QtWidgets import QSizePolicy, QTreeWidget, QTreeWidgetItem, QGroupBox
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QFileDialog, QLabel, QCheckBox, QGroupBox, QScrollArea, QRadioButton, QButtonGroup,
@@ -667,169 +689,141 @@ class DataSource:
         return self.file_path.name
 
 
+
 class SeriesPanel(QGroupBox):
     on_changed = QtCore.Signal()
 
     def __init__(self, parent=None):
-        super().__init__("Series (File × Frequency)", parent)
-        # Scrollable container
-        self._container = QWidget()
-        self._v = QVBoxLayout(self._container)
-        self._v.setContentsMargins(0, 0, 0, 0)
+        super().__init__("Files", parent)
+        v = QVBoxLayout(self)
 
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setWidget(self._container)
-
-        # Bulk select buttons
+        # Bulk select buttons (exposed so other tabs can relabel them)
+        btns = QHBoxLayout()
         self.sel_all = QPushButton("Select All")
         self.sel_none = QPushButton("Select None")
-        self.sel_all.clicked.connect(self.select_all)
-        self.sel_none.clicked.connect(self.select_none)
+        btns.addWidget(self.sel_all); btns.addWidget(self.sel_none)
+        v.addLayout(btns)
 
-        outer = QVBoxLayout(self)
-        outer.addWidget(self.scroll)
-        btns = QHBoxLayout()
-        btns.addWidget(self.sel_all)
-        btns.addWidget(self.sel_none)
-        outer.addLayout(btns)
+        # Tree
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Files / Series"])
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setRootIsDecorated(True)
+        self.tree.setItemsExpandable(True)
+        v.addWidget(self.tree, 1)
 
-        # Data structures
-        # Map file index -> (file_checkbox, [child_checkboxes])
-        self._files = {}  # si -> (QCheckBox parent, list children)
-        # Map (si, freq_label) -> child checkbox
-        self._child_map = {}
+        # Backing store
+        self.sources_im = []  # list[DataSource]
 
-        # stretch at end (keeps list aligned at top)
-        self._v.addStretch(1)
+        # Signals
+        self.tree.itemChanged.connect(self._on_item_changed)
+        self.sel_all.clicked.connect(self._select_all_files)
+        self.sel_none.clicked.connect(self._clear_all_files)
 
-    def _clear_list(self):
-        # remove widgets except trailing stretch
-        for i in reversed(range(self._v.count())):
-            item = self._v.itemAt(i)
-            if item is None:
-                continue
-            w = item.widget()
-            if w is not None:
-                w.setParent(None)
-        # re-add a fresh stretch
-        self._v.addStretch(1)
-
-    def set_series(self, sources: List['DataSource']):
-        # wipe UI & maps
-        self._clear_list()
-        self._files.clear()
-        self._child_map.clear()
-
-        # Build: for each file -> a tri-state checkbox, then indented child checkboxes for frequencies
-        for si, src in enumerate(sources):
-            # Parent (file) checkbox with tri-state
-            file_cb = QCheckBox(f"[IM] {src.file_label}")
-            file_cb.setTristate(True)
-            file_cb.setCheckState(Qt.Checked)
-            file_cb.setStyleSheet("font-weight:600;")  # bolder to read
-            self._v.insertWidget(self._v.count() - 1, file_cb)
-
-            children = []
-            for lab in src.labels_sorted:
-                child = QCheckBox(f"{lab}")
-                child.setChecked(True)
-                # indent children visually
-                child.setStyleSheet("margin-left: 22px;")
-                # connect child toggles
-                child.stateChanged.connect(lambda _st, idx=si: self._on_child_toggled(idx))
-                self._v.insertWidget(self._v.count() - 1, child)
-                self._child_map[(si, lab)] = child
-                children.append(child)
-
-            # Connect parent after children exist (so it can toggle them)
-            file_cb.stateChanged.connect(lambda st, idx=si: self._on_file_toggled(idx, st))
-            self._files[si] = (file_cb, children)
-
-        # announce
+    # ---- Public API ----
+    def set_series(self, sources):
+        """sources: list[DataSource]"""
+        self.tree.blockSignals(True)
+        try:
+            self.tree.clear()
+            self.sources_im = list(sources)
+            for i, src in enumerate(self.sources_im):
+                self._insert_im_into_tree(i, src)
+        finally:
+            self.tree.blockSignals(False)
         self.on_changed.emit()
 
-    def _on_file_toggled(self, si: int, state: int):
-        """Parent (file) checkbox toggled → apply to all children.
-        PartiallyChecked acts as a TOGGLE: if any child is ON → turn ALL OFF; else turn ALL ON.
-        """
-        if si not in self._files:
-            return
-        parent, children = self._files[si]
-
-        # decide target
-        if state == Qt.PartiallyChecked:
-            any_on = any(c.isChecked() for c in children)
-            target = not any_on
-        else:
-            target = (state == Qt.Checked)
-
-        # block child signals while applying
-        prev = [c.blockSignals(True) for c in children]
-        try:
-            for c in children:
-                c.setChecked(target)
-        finally:
-            for i, c in enumerate(children):
-                c.blockSignals(False)
-
-        # normalize parent state to full Checked/Unchecked to keep UX sane
-        was = parent.blockSignals(True)
-        try:
-            parent.setCheckState(Qt.Checked if target else Qt.Unchecked)
-        finally:
-            parent.blockSignals(was)
-
-        # notify app
-        self.on_changed.emit()
-
-    def _on_child_toggled(self, si: int):
-        # Children changed: recompute parent tri-state
-        if si not in self._files:
-            return
-        parent, children = self._files[si]
-        total = len(children)
-        checked = sum(1 for c in children if c.isChecked())
-        # Block parent signal to prevent bouncing back to children
-        was = parent.blockSignals(True)
-        try:
-            if checked == 0:
-                parent.setCheckState(Qt.Unchecked)
-            elif checked == total:
-                parent.setCheckState(Qt.Checked)
-            else:
-                parent.setCheckState(Qt.PartiallyChecked)
-        finally:
-            parent.blockSignals(was)
-        # Emit once
-        self.on_changed.emit()
-
-    def selected_series(self) -> list:
-        """Return list of (file_index, freq_label) that are ON (child checked)."""
+    def selected_series(self):
+        """Return [(file_index, freq_label)] for checked children under non-Unchecked parents."""
         out = []
-        for (si, lab), child in self._child_map.items():
-            if child.isChecked():
-                out.append((si, lab))
+        for i in range(self.tree.topLevelItemCount()):
+            root = self.tree.topLevelItem(i)
+            role = root.data(0, Qt.UserRole)
+            if not role or role[0] != "im_file":
+                continue
+            if root.checkState(0) == Qt.Unchecked:
+                continue
+            file_idx = role[1]
+            for j in range(root.childCount()):
+                child = root.child(j)
+                if child.checkState(0) != Qt.Checked:
+                    continue
+                crole = child.data(0, Qt.UserRole)
+                if crole and crole[0] == "im_freq":
+                    _, fidx, fl = crole
+                    out.append((fidx, fl))
         return out
 
-    def select_all(self):
-        # Turn on all children and set all parents Checked
-        for si, (parent, children) in self._files.items():
-            for c in children:
-                c.setChecked(True)
-            was = parent.blockSignals(True)
-            parent.setCheckState(Qt.Checked)
-            parent.blockSignals(was)
+    # ---- Internals ----
+    def _insert_im_into_tree(self, file_index, src):
+        # Parent/file item
+        root = QTreeWidgetItem([f"[IM] {src.file_label}"])
+        root.setFlags(root.flags() | ITEM_USERCHECKABLE | ITEM_TRISTATE)
+        root.setCheckState(0, Qt.Checked)
+        root.setData(0, Qt.UserRole, ("im_file", file_index))
+        self.tree.addTopLevelItem(root)
+
+        # Children: frequencies
+        for fl in getattr(src, "labels_sorted", []):
+            child = QTreeWidgetItem([f"{fl}"])
+            child.setFlags(child.flags() | ITEM_USERCHECKABLE)
+            child.setCheckState(0, Qt.Checked)
+            child.setData(0, Qt.UserRole, ("im_freq", file_index, fl))
+            root.addChild(child)
+        root.setExpanded(True)
+
+    def _on_item_changed(self, item: QTreeWidgetItem, column: int):
+        self.tree.blockSignals(True)
+        try:
+            if item.childCount() > 0:
+                # Parent toggled -> propagate to children
+                state = item.checkState(0)
+                if state == Qt.PartiallyChecked:
+                    # Treat partial click as toggle all
+                    any_on = any(item.child(i).checkState(0) == Qt.Checked for i in range(item.childCount()))
+                    state = Qt.Unchecked if any_on else Qt.Checked
+                    item.setCheckState(0, state)
+                for i in range(item.childCount()):
+                    item.child(i).setCheckState(0, state)
+            else:
+                # Child toggled -> recompute parent tri-state
+                parent = item.parent()
+                if parent is not None:
+                    total = parent.childCount()
+                    checked = sum(1 for i in range(total) if parent.child(i).checkState(0) == Qt.Checked)
+                    if checked == 0:
+                        parent.setCheckState(0, Qt.Unchecked)
+                    elif checked == total:
+                        parent.setCheckState(0, Qt.Checked)
+                    else:
+                        parent.setCheckState(0, Qt.PartiallyChecked)
+        finally:
+            self.tree.blockSignals(False)
         self.on_changed.emit()
 
-    def select_none(self):
-        # Turn off all children and set all parents Unchecked
-        for si, (parent, children) in self._files.items():
-            for c in children:
-                c.setChecked(False)
-            was = parent.blockSignals(True)
-            parent.setCheckState(Qt.Unchecked)
-            parent.blockSignals(was)
+    # Bulk helpers
+    def _select_all_files(self):
+        self.tree.blockSignals(True)
+        try:
+            for i in range(self.tree.topLevelItemCount()):
+                root = self.tree.topLevelItem(i)
+                root.setCheckState(0, Qt.Checked)
+                for j in range(root.childCount()):
+                    root.child(j).setCheckState(0, Qt.Checked)
+        finally:
+            self.tree.blockSignals(False)
+        self.on_changed.emit()
+
+    def _clear_all_files(self):
+        self.tree.blockSignals(True)
+        try:
+            for i in range(self.tree.topLevelItemCount()):
+                root = self.tree.topLevelItem(i)
+                root.setCheckState(0, Qt.Unchecked)
+                for j in range(root.childCount()):
+                    root.child(j).setCheckState(0, Qt.Unchecked)
+        finally:
+            self.tree.blockSignals(False)
         self.on_changed.emit()
 
 
@@ -2026,6 +2020,10 @@ class MainWindowSingle(QMainWindow):
         self.series_panel = SeriesPanel()
         self.controls = ControlsPanel()
         self.controls.on_changed.connect(self._on_controls_changed)
+        try:
+            self.series_panel.on_changed.connect(self._on_series_changed)
+        except Exception:
+            pass
         try:
             self.series_panel.on_changed.connect(self._on_series_changed)
         except Exception:
