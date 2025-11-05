@@ -57,7 +57,7 @@ QUICK START
        pip install PySide6 matplotlib numpy pandas
 
 3) Run:
-       python im_app_single_sidebar_SCROLL_TABLES_COLORFILE_FINAL_fix.py
+       python parser_main.py
 
 4) In the app:
    - IM tab:  “Open .im…”             (load one or more .im files)
