@@ -1,5 +1,5 @@
+from PySide6.QtCore import Qt
 
-from __future__ import annotations
 
 import sys, traceback, re, json
 from pathlib import Path
@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from PySide6 import QtWidgets, QtCore, QtGui
+from PySide6.QtWidgets import QSizePolicy
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QFileDialog, QLabel, QCheckBox, QGroupBox, QScrollArea, QRadioButton, QButtonGroup,
@@ -665,47 +666,172 @@ class DataSource:
     def file_label(self) -> str:
         return self.file_path.name
 
+
 class SeriesPanel(QGroupBox):
     on_changed = QtCore.Signal()
+
     def __init__(self, parent=None):
         super().__init__("Series (File × Frequency)", parent)
-        self.box = QWidget()
-        self.v = QVBoxLayout(self.box); self.v.setContentsMargins(0,0,0,0)
-        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setWidget(self.box)
-        self.sel_all = QPushButton("Select All"); self.sel_none = QPushButton("Select None")
-        self.sel_all.clicked.connect(self.select_all); self.sel_none.clicked.connect(self.select_none)
-        outer = QVBoxLayout(self); outer.addWidget(self.scroll)
-        btns = QHBoxLayout(); btns.addWidget(self.sel_all); btns.addWidget(self.sel_none); outer.addLayout(btns)
-        self._checks: Dict[str, tuple] = {}
-        self.v.addStretch(1)
+        # Scrollable container
+        self._container = QWidget()
+        self._v = QVBoxLayout(self._container)
+        self._v.setContentsMargins(0, 0, 0, 0)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setWidget(self._container)
+
+        # Bulk select buttons
+        self.sel_all = QPushButton("Select All")
+        self.sel_none = QPushButton("Select None")
+        self.sel_all.clicked.connect(self.select_all)
+        self.sel_none.clicked.connect(self.select_none)
+
+        outer = QVBoxLayout(self)
+        outer.addWidget(self.scroll)
+        btns = QHBoxLayout()
+        btns.addWidget(self.sel_all)
+        btns.addWidget(self.sel_none)
+        outer.addLayout(btns)
+
+        # Data structures
+        # Map file index -> (file_checkbox, [child_checkboxes])
+        self._files = {}  # si -> (QCheckBox parent, list children)
+        # Map (si, freq_label) -> child checkbox
+        self._child_map = {}
+
+        # stretch at end (keeps list aligned at top)
+        self._v.addStretch(1)
+
+    def _clear_list(self):
+        # remove widgets except trailing stretch
+        for i in reversed(range(self._v.count())):
+            item = self._v.itemAt(i)
+            if item is None:
+                continue
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+        # re-add a fresh stretch
+        self._v.addStretch(1)
+
     def set_series(self, sources: List['DataSource']):
-        for i in reversed(range(self.v.count()-1)):
-            item = self.v.itemAt(i); w = item.widget() if item else None
-            if w: w.setParent(None)
-        self._checks.clear()
+        # wipe UI & maps
+        self._clear_list()
+        self._files.clear()
+        self._child_map.clear()
+
+        # Build: for each file -> a tri-state checkbox, then indented child checkboxes for frequencies
         for si, src in enumerate(sources):
-            lbl = QLabel(f"📄 {src.file_label}"); lbl.setStyleSheet("font-weight:600;")
-            self.v.insertWidget(self.v.count()-1, lbl)
+            # Parent (file) checkbox with tri-state
+            file_cb = QCheckBox(f"[IM] {src.file_label}")
+            file_cb.setTristate(True)
+            file_cb.setCheckState(Qt.Checked)
+            file_cb.setStyleSheet("font-weight:600;")  # bolder to read
+            self._v.insertWidget(self._v.count() - 1, file_cb)
+
+            children = []
             for lab in src.labels_sorted:
-                series_id = f"{si}::{lab}"
-                cb = QCheckBox(f"{lab}")
-                cb.setChecked(True)
-                cb.stateChanged.connect(lambda _st, sid=series_id: self.on_changed.emit())
-                self.v.insertWidget(self.v.count()-1, cb)
-                self._checks[series_id] = (cb, si, lab)
+                child = QCheckBox(f"{lab}")
+                child.setChecked(True)
+                # indent children visually
+                child.setStyleSheet("margin-left: 22px;")
+                # connect child toggles
+                child.stateChanged.connect(lambda _st, idx=si: self._on_child_toggled(idx))
+                self._v.insertWidget(self._v.count() - 1, child)
+                self._child_map[(si, lab)] = child
+                children.append(child)
+
+            # Connect parent after children exist (so it can toggle them)
+            file_cb.stateChanged.connect(lambda st, idx=si: self._on_file_toggled(idx, st))
+            self._files[si] = (file_cb, children)
+
+        # announce
         self.on_changed.emit()
+
+    def _on_file_toggled(self, si: int, state: int):
+        """Parent (file) checkbox toggled → apply to all children.
+        PartiallyChecked acts as a TOGGLE: if any child is ON → turn ALL OFF; else turn ALL ON.
+        """
+        if si not in self._files:
+            return
+        parent, children = self._files[si]
+
+        # decide target
+        if state == Qt.PartiallyChecked:
+            any_on = any(c.isChecked() for c in children)
+            target = not any_on
+        else:
+            target = (state == Qt.Checked)
+
+        # block child signals while applying
+        prev = [c.blockSignals(True) for c in children]
+        try:
+            for c in children:
+                c.setChecked(target)
+        finally:
+            for i, c in enumerate(children):
+                c.blockSignals(False)
+
+        # normalize parent state to full Checked/Unchecked to keep UX sane
+        was = parent.blockSignals(True)
+        try:
+            parent.setCheckState(Qt.Checked if target else Qt.Unchecked)
+        finally:
+            parent.blockSignals(was)
+
+        # notify app
+        self.on_changed.emit()
+
+    def _on_child_toggled(self, si: int):
+        # Children changed: recompute parent tri-state
+        if si not in self._files:
+            return
+        parent, children = self._files[si]
+        total = len(children)
+        checked = sum(1 for c in children if c.isChecked())
+        # Block parent signal to prevent bouncing back to children
+        was = parent.blockSignals(True)
+        try:
+            if checked == 0:
+                parent.setCheckState(Qt.Unchecked)
+            elif checked == total:
+                parent.setCheckState(Qt.Checked)
+            else:
+                parent.setCheckState(Qt.PartiallyChecked)
+        finally:
+            parent.blockSignals(was)
+        # Emit once
+        self.on_changed.emit()
+
     def selected_series(self) -> list:
+        """Return list of (file_index, freq_label) that are ON (child checked)."""
         out = []
-        for sid, (cb, si, lab) in self._checks.items():
-            if cb.isChecked():
+        for (si, lab), child in self._child_map.items():
+            if child.isChecked():
                 out.append((si, lab))
         return out
+
     def select_all(self):
-        for cb, *_ in self._checks.values(): cb.setChecked(True)
+        # Turn on all children and set all parents Checked
+        for si, (parent, children) in self._files.items():
+            for c in children:
+                c.setChecked(True)
+            was = parent.blockSignals(True)
+            parent.setCheckState(Qt.Checked)
+            parent.blockSignals(was)
         self.on_changed.emit()
+
     def select_none(self):
-        for cb, *_ in self._checks.values(): cb.setChecked(False)
+        # Turn off all children and set all parents Unchecked
+        for si, (parent, children) in self._files.items():
+            for c in children:
+                c.setChecked(False)
+            was = parent.blockSignals(True)
+            parent.setCheckState(Qt.Unchecked)
+            parent.blockSignals(was)
         self.on_changed.emit()
+
 
 class ControlsPanel(QGroupBox):
     on_changed = QtCore.Signal()
@@ -841,24 +967,24 @@ class ControlsPanel(QGroupBox):
         self.cb_ax_irl  = QCheckBox("IRL or Spectrum"); self.cb_ax_irl.setChecked(True); self.cb_ax_irl.stateChanged.connect(lambda _st: self.on_changed.emit())
         v.addWidget(self.cb_ax_gain); v.addWidget(self.cb_ax_ampm); v.addWidget(self.cb_ax_eff); v.addWidget(self.cb_ax_irl)
 
-        # Axis scale combos
-        def scale_combo():
-            c = QComboBox(); c.addItems(["linear","log"]); return c
-        v.addWidget(QLabel("Axis scales (x,y)"))
+        # # Axis scale combos
+        # def scale_combo():
+            # c = QComboBox(); c.addItems(["linear","log"]); return c
+        # v.addWidget(QLabel("Axis scales (x,y)"))
 
-        row_sc1 = QHBoxLayout(); row_sc1.addWidget(QLabel("Gain"))
-        self.cmb_gx = scale_combo(); self.cmb_gy = scale_combo(); row_sc1.addWidget(self.cmb_gx); row_sc1.addWidget(self.cmb_gy); v.addLayout(row_sc1)
-        row_sc2 = QHBoxLayout(); row_sc2.addWidget(QLabel("AM/PM/ACPR"))
-        self.cmb_ax = scale_combo(); self.cmb_ay = scale_combo(); row_sc2.addWidget(self.cmb_ax); row_sc2.addWidget(self.cmb_ay); v.addLayout(row_sc2)
-        row_sc3 = QHBoxLayout(); row_sc3.addWidget(QLabel("Efficiency"))
-        self.cmb_ex = scale_combo(); self.cmb_ey = scale_combo(); row_sc3.addWidget(self.cmb_ex); row_sc3.addWidget(self.cmb_ey); v.addLayout(row_sc3)
-        row_sc4 = QHBoxLayout(); row_sc4.addWidget(QLabel("IRL/Spectrum"))
-        self.cmb_ix = scale_combo(); self.cmb_iy = scale_combo(); row_sc4.addWidget(self.cmb_ix); row_sc4.addWidget(self.cmb_iy); v.addLayout(row_sc4)
+        # row_sc1 = QHBoxLayout(); row_sc1.addWidget(QLabel("Gain"))
+        # self.cmb_gx = scale_combo(); self.cmb_gy = scale_combo(); row_sc1.addWidget(self.cmb_gx); row_sc1.addWidget(self.cmb_gy); v.addLayout(row_sc1)
+        # row_sc2 = QHBoxLayout(); row_sc2.addWidget(QLabel("AM/PM/ACPR"))
+        # self.cmb_ax = scale_combo(); self.cmb_ay = scale_combo(); row_sc2.addWidget(self.cmb_ax); row_sc2.addWidget(self.cmb_ay); v.addLayout(row_sc2)
+        # row_sc3 = QHBoxLayout(); row_sc3.addWidget(QLabel("Efficiency"))
+        # self.cmb_ex = scale_combo(); self.cmb_ey = scale_combo(); row_sc3.addWidget(self.cmb_ex); row_sc3.addWidget(self.cmb_ey); v.addLayout(row_sc3)
+        # row_sc4 = QHBoxLayout(); row_sc4.addWidget(QLabel("IRL/Spectrum"))
+        # self.cmb_ix = scale_combo(); self.cmb_iy = scale_combo(); row_sc4.addWidget(self.cmb_ix); row_sc4.addWidget(self.cmb_iy); v.addLayout(row_sc4)
 
-        for cmb in [self.cmb_gx,self.cmb_gy,self.cmb_ax,self.cmb_ay,self.cmb_ex,self.cmb_ey,self.cmb_ix,self.cmb_iy]:
-            cmb.currentIndexChanged.connect(lambda _i: self.on_changed.emit())
+        # for cmb in [self.cmb_gx,self.cmb_gy,self.cmb_ax,self.cmb_ay,self.cmb_ex,self.cmb_ey,self.cmb_ix,self.cmb_iy]:
+            # cmb.currentIndexChanged.connect(lambda _i: self.on_changed.emit())
 
-        v.addStretch(1)
+        # v.addStretch(1)
 
 
     def set_mode(self, mode: str):
@@ -1900,8 +2026,26 @@ class MainWindowSingle(QMainWindow):
         self.series_panel = SeriesPanel()
         self.controls = ControlsPanel()
         self.controls.on_changed.connect(self._on_controls_changed)
+        try:
+            self.series_panel.on_changed.connect(self._on_series_changed)
+        except Exception:
+            pass
+        try:
+            self.series_panel.on_changed.connect(self._on_series_changed)
+        except Exception:
+            pass
+        try:
+            self.series_panel.on_changed.connect(self._on_series_changed)
+        except Exception:
+            pass
 
-        # Tabs container
+        
+        # update when file/freq checkboxes change
+        try:
+            self.series_panel.on_changed.connect(self._on_series_changed)
+        except Exception:
+            pass
+# Tabs container
         self.tabs = QTabWidget(self)
 
         # --- IM Tab (using baseline PlotGrid) ---
@@ -1934,10 +2078,8 @@ class MainWindowSingle(QMainWindow):
         left_sidebar = QWidget()
         left_v = QVBoxLayout(left_sidebar)
         left_v.setContentsMargins(8, 8, 8, 8)
-        left_v.addWidget(self.series_panel)
-        left_v.addWidget(self.controls)
-        left_v.addStretch(1)
-
+        left_v.addWidget(self.series_panel, 3)
+        left_v.addWidget(self.controls, 1)
         # --- Scrollable charts area ---
         scroll = QScrollArea(self); scroll.setWidgetResizable(True)
         tabs_container = QWidget(); tabs_layout = QVBoxLayout(tabs_container)
@@ -1947,7 +2089,8 @@ class MainWindowSingle(QMainWindow):
 
         splitter = QSplitter(QtCore.Qt.Orientation.Horizontal, self)
         splitter.addWidget(left_sidebar); splitter.addWidget(scroll)
-        splitter.setStretchFactor(0,0); splitter.setStretchFactor(1,1)
+        splitter.setSizes([520, 980])
+        splitter.setStretchFactor(1,2); splitter.setStretchFactor(1,1)
         left_sidebar.setMinimumWidth(300)
         self.setCentralWidget(splitter)
         # Install wheel forwarding so the mouse wheel scrolls the page even over canvases
@@ -2165,6 +2308,20 @@ class MainWindowSingle(QMainWindow):
 
 # ---------- Mouse wheel forwarding ----------
 from PySide6 import QtGui as _QtGui
+def _on_series_changed(self):
+        # Update plots and tables when tree checkboxes change
+    try:
+        self._refresh_tables()
+    except Exception:
+        pass
+    try:
+        self._on_controls_changed()
+    except Exception:
+        try:
+            self.update_plots()
+        except Exception:
+            pass
+
 class _WheelForwardFilter(QtCore.QObject):
     def __init__(self, target_scroll_area):
         super().__init__(); self.target = target_scroll_area
