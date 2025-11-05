@@ -1,5 +1,27 @@
+from PySide6.QtCore import Qt
 
-from __future__ import annotations
+
+
+
+
+
+# ---- Qt flag fallbacks for broader PySide6 compatibility ----
+# Produce values of type Qt.ItemFlag so bitwise OR with item.flags() works.
+try:
+    ITEM_TRISTATE = getattr(Qt, 'ItemIsTristate')
+except Exception:
+    # 0x100 is the usual value; wrap as Qt.ItemFlag
+    ITEM_TRISTATE = Qt.ItemFlag(0x100)
+try:
+    ITEM_USERCHECKABLE = getattr(Qt, 'ItemIsUserCheckable')
+except Exception:
+    # 0x10 is the usual value; wrap as Qt.ItemFlag
+    ITEM_USERCHECKABLE = Qt.ItemFlag(0x10)
+
+except Exception:
+    # If Qt isn't available yet for some reason, hard fallback values
+    ITEM_TRISTATE = 0x100
+    ITEM_USERCHECKABLE = 0x10
 
 import sys, traceback, re, json
 from pathlib import Path
@@ -8,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from PySide6 import QtWidgets, QtCore, QtGui
+from PySide6.QtWidgets import QSizePolicy, QTreeWidget, QTreeWidgetItem, QGroupBox
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QFileDialog, QLabel, QCheckBox, QGroupBox, QScrollArea, QRadioButton, QButtonGroup,
@@ -665,47 +688,144 @@ class DataSource:
     def file_label(self) -> str:
         return self.file_path.name
 
+
+
 class SeriesPanel(QGroupBox):
     on_changed = QtCore.Signal()
+
     def __init__(self, parent=None):
-        super().__init__("Series (File × Frequency)", parent)
-        self.box = QWidget()
-        self.v = QVBoxLayout(self.box); self.v.setContentsMargins(0,0,0,0)
-        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setWidget(self.box)
-        self.sel_all = QPushButton("Select All"); self.sel_none = QPushButton("Select None")
-        self.sel_all.clicked.connect(self.select_all); self.sel_none.clicked.connect(self.select_none)
-        outer = QVBoxLayout(self); outer.addWidget(self.scroll)
-        btns = QHBoxLayout(); btns.addWidget(self.sel_all); btns.addWidget(self.sel_none); outer.addLayout(btns)
-        self._checks: Dict[str, tuple] = {}
-        self.v.addStretch(1)
-    def set_series(self, sources: List['DataSource']):
-        for i in reversed(range(self.v.count()-1)):
-            item = self.v.itemAt(i); w = item.widget() if item else None
-            if w: w.setParent(None)
-        self._checks.clear()
-        for si, src in enumerate(sources):
-            lbl = QLabel(f"📄 {src.file_label}"); lbl.setStyleSheet("font-weight:600;")
-            self.v.insertWidget(self.v.count()-1, lbl)
-            for lab in src.labels_sorted:
-                series_id = f"{si}::{lab}"
-                cb = QCheckBox(f"{lab}")
-                cb.setChecked(True)
-                cb.stateChanged.connect(lambda _st, sid=series_id: self.on_changed.emit())
-                self.v.insertWidget(self.v.count()-1, cb)
-                self._checks[series_id] = (cb, si, lab)
+        super().__init__("Files", parent)
+        v = QVBoxLayout(self)
+
+        # Bulk select buttons (exposed so other tabs can relabel them)
+        btns = QHBoxLayout()
+        self.sel_all = QPushButton("Select All")
+        self.sel_none = QPushButton("Select None")
+        btns.addWidget(self.sel_all); btns.addWidget(self.sel_none)
+        v.addLayout(btns)
+
+        # Tree
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Files / Series"])
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setRootIsDecorated(True)
+        self.tree.setItemsExpandable(True)
+        v.addWidget(self.tree, 1)
+
+        # Backing store
+        self.sources_im = []  # list[DataSource]
+
+        # Signals
+        self.tree.itemChanged.connect(self._on_item_changed)
+        self.sel_all.clicked.connect(self._select_all_files)
+        self.sel_none.clicked.connect(self._clear_all_files)
+
+    # ---- Public API ----
+    def set_series(self, sources):
+        """sources: list[DataSource]"""
+        self.tree.blockSignals(True)
+        try:
+            self.tree.clear()
+            self.sources_im = list(sources)
+            for i, src in enumerate(self.sources_im):
+                self._insert_im_into_tree(i, src)
+        finally:
+            self.tree.blockSignals(False)
         self.on_changed.emit()
-    def selected_series(self) -> list:
+
+    def selected_series(self):
+        """Return [(file_index, freq_label)] for checked children under non-Unchecked parents."""
         out = []
-        for sid, (cb, si, lab) in self._checks.items():
-            if cb.isChecked():
-                out.append((si, lab))
+        for i in range(self.tree.topLevelItemCount()):
+            root = self.tree.topLevelItem(i)
+            role = root.data(0, Qt.UserRole)
+            if not role or role[0] != "im_file":
+                continue
+            if root.checkState(0) == Qt.Unchecked:
+                continue
+            file_idx = role[1]
+            for j in range(root.childCount()):
+                child = root.child(j)
+                if child.checkState(0) != Qt.Checked:
+                    continue
+                crole = child.data(0, Qt.UserRole)
+                if crole and crole[0] == "im_freq":
+                    _, fidx, fl = crole
+                    out.append((fidx, fl))
         return out
-    def select_all(self):
-        for cb, *_ in self._checks.values(): cb.setChecked(True)
+
+    # ---- Internals ----
+    def _insert_im_into_tree(self, file_index, src):
+        # Parent/file item
+        root = QTreeWidgetItem([f"[IM] {src.file_label}"])
+        root.setFlags(root.flags() | ITEM_USERCHECKABLE | ITEM_TRISTATE)
+        root.setCheckState(0, Qt.Checked)
+        root.setData(0, Qt.UserRole, ("im_file", file_index))
+        self.tree.addTopLevelItem(root)
+
+        # Children: frequencies
+        for fl in getattr(src, "labels_sorted", []):
+            child = QTreeWidgetItem([f"{fl}"])
+            child.setFlags(child.flags() | ITEM_USERCHECKABLE)
+            child.setCheckState(0, Qt.Checked)
+            child.setData(0, Qt.UserRole, ("im_freq", file_index, fl))
+            root.addChild(child)
+        root.setExpanded(True)
+
+    def _on_item_changed(self, item: QTreeWidgetItem, column: int):
+        self.tree.blockSignals(True)
+        try:
+            if item.childCount() > 0:
+                # Parent toggled -> propagate to children
+                state = item.checkState(0)
+                if state == Qt.PartiallyChecked:
+                    # Treat partial click as toggle all
+                    any_on = any(item.child(i).checkState(0) == Qt.Checked for i in range(item.childCount()))
+                    state = Qt.Unchecked if any_on else Qt.Checked
+                    item.setCheckState(0, state)
+                for i in range(item.childCount()):
+                    item.child(i).setCheckState(0, state)
+            else:
+                # Child toggled -> recompute parent tri-state
+                parent = item.parent()
+                if parent is not None:
+                    total = parent.childCount()
+                    checked = sum(1 for i in range(total) if parent.child(i).checkState(0) == Qt.Checked)
+                    if checked == 0:
+                        parent.setCheckState(0, Qt.Unchecked)
+                    elif checked == total:
+                        parent.setCheckState(0, Qt.Checked)
+                    else:
+                        parent.setCheckState(0, Qt.PartiallyChecked)
+        finally:
+            self.tree.blockSignals(False)
         self.on_changed.emit()
-    def select_none(self):
-        for cb, *_ in self._checks.values(): cb.setChecked(False)
+
+    # Bulk helpers
+    def _select_all_files(self):
+        self.tree.blockSignals(True)
+        try:
+            for i in range(self.tree.topLevelItemCount()):
+                root = self.tree.topLevelItem(i)
+                root.setCheckState(0, Qt.Checked)
+                for j in range(root.childCount()):
+                    root.child(j).setCheckState(0, Qt.Checked)
+        finally:
+            self.tree.blockSignals(False)
         self.on_changed.emit()
+
+    def _clear_all_files(self):
+        self.tree.blockSignals(True)
+        try:
+            for i in range(self.tree.topLevelItemCount()):
+                root = self.tree.topLevelItem(i)
+                root.setCheckState(0, Qt.Unchecked)
+                for j in range(root.childCount()):
+                    root.child(j).setCheckState(0, Qt.Unchecked)
+        finally:
+            self.tree.blockSignals(False)
+        self.on_changed.emit()
+
 
 class ControlsPanel(QGroupBox):
     on_changed = QtCore.Signal()
@@ -1893,15 +2013,37 @@ from PySide6.QtWidgets import (
 class MainWindowSingle(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("IM & S-parameters Viewer")
+        self.setWindowTitle("IM & S-parameters Viewer — Single File")
         self.sources = []  # List[DataSource]
 
         # Left: Series + Controls (baseline widgets)
         self.series_panel = SeriesPanel()
         self.controls = ControlsPanel()
         self.controls.on_changed.connect(self._on_controls_changed)
+        try:
+            self.series_panel.on_changed.connect(self._on_series_changed)
+        except Exception:
+            pass
+        try:
+            self.series_panel.on_changed.connect(self._on_series_changed)
+        except Exception:
+            pass
+        try:
+            self.series_panel.on_changed.connect(self._on_series_changed)
+        except Exception:
+            pass
+        try:
+            self.series_panel.on_changed.connect(self._on_series_changed)
+        except Exception:
+            pass
 
-        # Tabs container
+        
+        # update when file/freq checkboxes change
+        try:
+            self.series_panel.on_changed.connect(self._on_series_changed)
+        except Exception:
+            pass
+# Tabs container
         self.tabs = QTabWidget(self)
 
         # --- IM Tab (using baseline PlotGrid) ---
@@ -1934,10 +2076,8 @@ class MainWindowSingle(QMainWindow):
         left_sidebar = QWidget()
         left_v = QVBoxLayout(left_sidebar)
         left_v.setContentsMargins(8, 8, 8, 8)
-        left_v.addWidget(self.series_panel)
-        left_v.addWidget(self.controls)
-        left_v.addStretch(1)
-
+        left_v.addWidget(self.series_panel, 3)
+        left_v.addWidget(self.controls, 1)
         # --- Scrollable charts area ---
         scroll = QScrollArea(self); scroll.setWidgetResizable(True)
         tabs_container = QWidget(); tabs_layout = QVBoxLayout(tabs_container)
@@ -1948,7 +2088,7 @@ class MainWindowSingle(QMainWindow):
         splitter = QSplitter(QtCore.Qt.Orientation.Horizontal, self)
         splitter.addWidget(left_sidebar); splitter.addWidget(scroll)
         splitter.setSizes([520, 980])
-        splitter.setStretchFactor(0,0); splitter.setStretchFactor(1,1)
+        splitter.setStretchFactor(1,2); splitter.setStretchFactor(1,1)
         left_sidebar.setMinimumWidth(300)
         self.setCentralWidget(splitter)
         # Install wheel forwarding so the mouse wheel scrolls the page even over canvases
@@ -2166,6 +2306,20 @@ class MainWindowSingle(QMainWindow):
 
 # ---------- Mouse wheel forwarding ----------
 from PySide6 import QtGui as _QtGui
+def _on_series_changed(self):
+        # Update plots and tables when tree checkboxes change
+    try:
+        self._refresh_tables()
+    except Exception:
+        pass
+    try:
+        self._on_controls_changed()
+    except Exception:
+        try:
+            self.update_plots()
+        except Exception:
+            pass
+
 class _WheelForwardFilter(QtCore.QObject):
     def __init__(self, target_scroll_area):
         super().__init__(); self.target = target_scroll_area
