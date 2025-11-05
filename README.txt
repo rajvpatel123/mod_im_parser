@@ -99,11 +99,11 @@ BUILD A ONE‑FILE EXE (WINDOWS)
 ---------------------------------------------------------------------
 - Easiest way for field/test‑bench machines:
     pip install pyinstaller
-    pyinstaller --noconsole --onefile im_app_single_sidebar_SCROLL_TABLES_COLORFILE_FINAL_fix.py
+    pyinstaller --noconsole --onefile parser_main.py
 
 - The EXE will be in “dist/”. You may share the single EXE with coworkers.
 - If Qt plugins are missing in the EXE environment, try:
-    pyinstaller --noconsole --onefile --add-data "C:\Python\Lib\site-packages\PySide6\plugins;PySide6\plugins" im_app_single_sidebar_SCROLL_TABLES_COLORFILE_FINAL_fix.py
+    pyinstaller --noconsole --onefile --add-data "C:\Python\Lib\site-packages\PySide6\plugins;PySide6\plugins" parser_main.py
   (Adjust the path to your PySide6 installation)
 
 ---------------------------------------------------------------------
